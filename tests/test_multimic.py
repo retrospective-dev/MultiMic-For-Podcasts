@@ -25,6 +25,7 @@ class FakeStream:
         self.samplerate = SR
         self.channels = channels
         self.time = 10.0
+        self.latency = 0.0
         self.active = True
 
 
@@ -46,7 +47,12 @@ def make_mic(index, name, channels):
     return mic
 
 
-def feed(mic, value, frames=100, adc=0.0):
+def feed(mic, value, frames=100, adc=None):
+    """Deliver one block. By default it was captured starting at the
+    stream's current time, and the clock moves on by its length."""
+    if adc is None:
+        adc = mic.stream.time
+        mic.stream.time += frames / SR
     block = np.full((frames, mic.stream.channels), value, np.float32)
     mic._callback(block, frames, TimeInfo(adc), Status())
 
@@ -218,3 +224,96 @@ def test_settings_round_trip(tmp_path, monkeypatch):
     assert mm.load_settings() == {}
     mm.save_settings({"format": "FLAC 24-bit", "mics": {"A": {"gain_db": 3}}})
     assert mm.load_settings()["mics"]["A"]["gain_db"] == 3
+
+
+def test_pause_and_resume(tmp_path):
+    a, b = make_mic(1, "A", 1), make_mic(2, "B", 1)
+    s = mm.Session([a, b], str(tmp_path), "WAV 16-bit")
+    s.start()
+    for value, blocks in ((0.1, 3), (0.9, 2), (0.3, 3)):
+        if value == 0.9:
+            s.pause()
+            assert s.paused
+        elif value == 0.3:
+            s.resume()
+            assert not s.paused
+        for _ in range(blocks):
+            feed(a, value)
+            feed(b, value)
+    assert s.position == pytest.approx(0.6)
+    s.stop()
+    for data in read_folder(s.folder).values():
+        assert len(data) == 600
+        assert data.max() < 0.5  # nothing from the paused stretch
+
+
+def test_pause_mid_block_is_sample_accurate(tmp_path):
+    mic = make_mic(1, "A", 1)
+    s = mm.Session([mic], str(tmp_path), "WAV 16-bit")
+    s.start()
+    feed(mic, 0.5)                 # 10.0 - 10.1
+    mic.stream.time = 10.15
+    s.pause()                      # pause half way through the next block
+    mic.stream.time = 10.2
+    feed(mic, 0.5, adc=10.1)       # 10.1 - 10.2: first 50 samples kept
+    s.stop()
+    assert len(read_folder(s.folder)["01_A.wav"]) == 150
+
+
+def test_files_end_together(tmp_path):
+    a, b = make_mic(1, "A", 1), make_mic(2, "B", 1)
+    s = mm.Session([a, b], str(tmp_path), "WAV 16-bit")
+    s.start()
+    for _ in range(3):
+        feed(a, 0.5)
+        feed(b, 0.5)
+    s.pause()
+    feed(b, 0.5)  # B's driver delivers one more block after the stop point
+    s.stop()
+    assert {len(d) for d in read_folder(s.folder).values()} == {300}
+
+
+def test_prerecord_buffer(tmp_path):
+    mic = make_mic(1, "A", 1)
+    mic.ring_seconds = 0.5
+    for _ in range(10):            # 1 s of audio before Record is pressed
+        feed(mic, 0.1)
+    s = mm.Session([mic], str(tmp_path), "WAV 16-bit")
+    s.start(preroll=0.3)
+    feed(mic, 0.5)
+    feed(mic, 0.5)
+    s.stop()
+    data = read_folder(s.folder)["01_A.wav"][:, 0]
+    assert len(data) == 500
+    assert data[:300] == pytest.approx(0.1, abs=1e-3)
+    assert data[300:] == pytest.approx(0.5, abs=1e-3)
+    assert s.position == pytest.approx(0.5)
+
+
+def test_prerecord_pads_when_buffer_is_short(tmp_path):
+    mic = make_mic(1, "A", 1)
+    mic.ring_seconds = 5
+    feed(mic, 0.1)                 # only 0.1 s buffered
+    s = mm.Session([mic], str(tmp_path), "WAV 16-bit")
+    s.start(preroll=0.3)
+    s.stop()
+    data = read_folder(s.folder)["01_A.wav"][:, 0]
+    assert len(data) == 300
+    assert data[:200].max() == 0
+    assert data[200:] == pytest.approx(0.1, abs=1e-3)
+
+
+def test_block_time_estimated_when_driver_gives_none(tmp_path):
+    mic = make_mic(1, "A", 1)
+    mic.stream.latency = 0.05
+    s = mm.Session([mic], str(tmp_path), "WAV 16-bit")
+    s.start()                      # starts at 10.0
+    # callback at 10.1 for a 100-sample block with 50 ms latency: the block
+    # started at 9.95, so its first 50 samples predate the start
+    mic.stream.time = 10.1
+    feed(mic, 0.5, adc=0.0)
+    s.pause()                      # stop point 10.1
+    mic.stream.time = 10.2
+    feed(mic, 0.5, adc=0.0)        # 10.05 - 10.15: 50 more samples
+    s.stop()
+    assert len(read_folder(s.folder)["01_A.wav"]) == 100

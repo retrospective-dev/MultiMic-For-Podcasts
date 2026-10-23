@@ -361,8 +361,16 @@ class Mic:
         self._file = None
         self._mix = None
         self._slot = 0
-        self._start_at = None
-        self._started = False
+        # Recording windows [start, end) on the stream clock; end is None
+        # while recording. Every mic gets the same windows, so start, pause,
+        # resume and stop land on the same instant in every file.
+        self._windows = []
+        self._last_block_end = 0.0
+        # Recent audio kept for the pre-record buffer.
+        self.ring_seconds = 0.0
+        self._ring = collections.deque()
+        self._ring_frames = 0
+        self._lock = threading.Lock()
 
     @property
     def is_open(self):
@@ -406,6 +414,33 @@ class Mic:
             finally:
                 self.stream = None
 
+    @property
+    def recording_now(self):
+        return bool(self._windows) and self._windows[-1][1] is None
+
+    def _block_time(self, frames, time_info):
+        """Stream time of the block's first sample. Some drivers don't
+        report it, so estimate it from the callback time and latency."""
+        now = getattr(time_info, "currentTime", 0) or self.stream.time
+        adc = time_info.inputBufferAdcTime
+        if adc > 0 and 0 <= now - adc < 1.0:
+            return adc
+        latency = getattr(self.stream, "latency", 0) or 0
+        return now - frames / self.stream.samplerate - latency
+
+    def _clip(self, adc, data):
+        """The part of a block that falls inside the recording windows."""
+        sr, n = self.stream.samplerate, len(data)
+        parts = []
+        for lo, hi in self._windows:
+            a = min(n, max(0, int(round((lo - adc) * sr))))
+            b = n if hi is None else min(n, max(0, int(round((hi - adc) * sr))))
+            if b > a:
+                parts.append(data[a:b])
+        if not parts:
+            return None
+        return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
     def _callback(self, indata, frames, time_info, status):
         self.last_audio = time.monotonic()
         if status.input_overflow:
@@ -416,43 +451,81 @@ class Mic:
             peak = float(np.abs(data).max())
             if peak > self.peak:
                 self.peak = peak
-            if peak >= CLIP_LEVEL and self._start_at is not None:
+            if peak >= CLIP_LEVEL and self.recording_now:
                 self.clips += 1
         monitor = self.monitor
         if monitor is not None:
             monitor.feed(data)
 
-        q, start = self._queue, self._start_at
-        if q is None or start is None:
-            return
-        if not self._started:
-            # Drop the samples captured before the shared start instant so
-            # every mic begins at (nearly) the same sample.
-            skip = 0
-            adc = time_info.inputBufferAdcTime
-            if adc > 0 and 0 < start - adc < 1.0:
-                skip = int(round((start - adc) * self.stream.samplerate))
-            if skip >= frames:
-                return
-            data = data[skip:]
-            self._started = True
-        q.put(data)
+        adc = self._block_time(frames, time_info)
+        with self._lock:
+            if self.ring_seconds > 0:
+                self._ring.append((adc, data))
+                self._ring_frames += frames
+                keep = self.ring_seconds * self.stream.samplerate + frames
+                while self._ring_frames - len(self._ring[0][1]) >= keep:
+                    self._ring_frames -= len(self._ring.popleft()[1])
+            elif self._ring:
+                self._ring.clear()
+                self._ring_frames = 0
+            q = self._queue
+            if q is not None and self._windows:
+                chunk = self._clip(adc, data)
+                if chunk is not None:
+                    q.put(chunk)
+            self._last_block_end = adc + frames / self.stream.samplerate
 
     def begin(self, writer, mix=None, slot=0):
         self.frames_written = 0
         self.overflows = 0
         self.clips = 0
         self.error = None
-        self._started = False
-        self._start_at = None
+        self._windows = []
         self._file = writer
         self._mix, self._slot = mix, slot
         self._queue = queue.Queue()
         self._writer = threading.Thread(target=self._write_loop, daemon=True)
         self._writer.start()
 
-    def arm(self):
-        self._start_at = self.stream.time
+    def arm(self, preroll=0.0):
+        """Start recording now, or preroll seconds ago from the
+        pre-record buffer (padded with silence if it holds less)."""
+        with self._lock:
+            t = self.stream.time
+            lo = t - preroll
+            self._windows = [[lo, None]]
+            if preroll > 0:
+                sr = self.stream.samplerate
+                first = self._ring[0][0] if self._ring else t
+                if first > lo:
+                    pad = int(round((first - lo) * sr))
+                    self._queue.put(np.zeros((pad, self.stream.channels),
+                                             np.float32))
+                for adc, data in self._ring:
+                    chunk = self._clip(adc, data)
+                    if chunk is not None:
+                        self._queue.put(chunk)
+        return t
+
+    def pause(self):
+        with self._lock:
+            if self.recording_now:
+                self._windows[-1][1] = self.stream.time
+
+    def resume(self):
+        with self._lock:
+            if self._windows and not self.recording_now:
+                now = self.stream.time
+                # blocks older than a couple of seconds never arrive late
+                self._windows = [w for w in self._windows if w[1] > now - 2]
+                self._windows.append([now, None])
+
+    @property
+    def caught_up(self):
+        """True once every block up to the last pause has arrived."""
+        if not self._windows or self.recording_now:
+            return True
+        return self._last_block_end >= self._windows[-1][1] or self.no_signal
 
     def _write_loop(self):
         q, f, mix, slot = self._queue, self._file, self._mix, self._slot
@@ -475,8 +548,9 @@ class Mic:
             f.close()
 
     def stop(self):
-        self._start_at = None
-        q, self._queue = self._queue, None
+        with self._lock:
+            self._windows = []
+            q, self._queue = self._queue, None
         if q is not None:
             q.put(None)
             self._writer.join()
@@ -509,14 +583,15 @@ class Session:
             folder += "_" + safe_name(name.strip())
         self.folder = os.path.join(out_root, folder)
         self.started = None
-        self._t0 = None
+        self.preroll = 0.0
+        self._final_position = None
 
     def _split_frames(self, samplerate):
         if not self.split_minutes:
             return None
         return int(self.split_minutes * 60 * samplerate)
 
-    def start(self):
+    def start(self, preroll=0.0):
         rates = {int(m.stream.samplerate) for m in self.mics}
         if self.mix_mode and len(rates) > 1:
             raise ValueError("Mixdown needs every mic at the same sample "
@@ -544,18 +619,35 @@ class Session:
             mic.begin(writer, self.mix, n - 1)
         # Streams are already running; arming them back to back makes them
         # all start writing from the same moment.
+        self.preroll = preroll
         for mic in self.mics:
-            mic.arm()
-        self._t0 = self.mics[0]._start_at
+            mic.arm(preroll)
         self.started = time.monotonic()
 
     @property
+    def paused(self):
+        return not self.mics[0].recording_now
+
+    def pause(self):
+        for mic in self.mics:
+            mic.pause()
+
+    def resume(self):
+        for mic in self.mics:
+            mic.resume()
+
+    @property
     def position(self):
-        """Seconds into the recording, on the first mic's audio clock."""
-        stream = self.mics[0].stream
-        if self._t0 is None or stream is None:
-            return self.elapsed
-        return max(0.0, stream.time - self._t0)
+        """Seconds of audio recorded so far (pauses don't count, the
+        pre-record buffer does), on the first mic's clock."""
+        if self._final_position is not None:
+            return self._final_position
+        mic = self.mics[0]
+        if not mic._windows or mic.stream is None:
+            return 0.0
+        now = mic.stream.time
+        return max(0.0, sum((now if hi is None else hi) - lo
+                            for lo, hi in mic._windows))
 
     def add_marker(self, label=None):
         t = self.position
@@ -590,8 +682,14 @@ class Session:
         return data_rate(self.mics, self.format_name, self.mix_mode)
 
     def stop(self):
-        for mic in self.mics:
-            mic._start_at = None
+        # End every file at the same instant, then give blocks captured
+        # before it (still in the drivers' buffers) a moment to arrive.
+        self.pause()
+        deadline = time.monotonic() + 1.0
+        while not all(m.caught_up for m in self.mics) \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self._final_position = self.position
         for mic in self.mics:
             mic.stop()
         if self.mix is not None:
@@ -606,7 +704,7 @@ class Session:
 
     @property
     def elapsed(self):
-        return time.monotonic() - self.started if self.started else 0.0
+        return self.position
 
 
 def fmt_time(seconds, millis=False):
@@ -860,8 +958,16 @@ def run_gui():
             self.name_entry = ttk.Entry(opts, width=28,
                                         textvariable=self.name_var)
             self.name_entry.pack(side="left", padx=4)
-            ttk.Label(opts, text="(optional, added to the folder name)",
+            ttk.Label(opts, text="(optional)",
                       foreground="#666").pack(side="left")
+            ttk.Label(opts, text="Pre-record").pack(side="left", padx=(16, 0))
+            self.preroll_var = tk.StringVar(
+                value=str(s.get("preroll_seconds", 0)))
+            self.preroll_box = ttk.Spinbox(
+                opts, from_=0, to=30, increment=1, width=4,
+                textvariable=self.preroll_var)
+            self.preroll_box.pack(side="left", padx=4)
+            ttk.Label(opts, text="s before Record").pack(side="left")
             ttk.Label(opts, text="min (0 = off)").pack(side="right")
             self.stop_after_var = tk.StringVar(
                 value=str(s.get("stop_after_minutes", 0)))
@@ -906,7 +1012,11 @@ def run_gui():
             self.marker_btn = ttk.Button(bottom, text="Marker (M)",
                                          state="disabled",
                                          command=self.add_marker)
-            self.marker_btn.pack(side="right", padx=(8, 4))
+            self.marker_btn.pack(side="right", padx=(4, 4))
+            self.pause_btn = ttk.Button(bottom, text="Pause (P)", width=12,
+                                        state="disabled",
+                                        command=self.toggle_pause)
+            self.pause_btn.pack(side="right", padx=(8, 0))
             self.clock = ttk.Label(bottom, text="00:00:00",
                                    font=("Consolas", 16))
             self.clock.pack(side="right", padx=12)
@@ -922,6 +1032,8 @@ def run_gui():
             root.bind("<space>", self.space)
             root.bind("<Key-m>", self.marker_key)
             root.bind("<Key-M>", self.marker_key)
+            root.bind("<Key-p>", self.pause_key)
+            root.bind("<Key-P>", self.pause_key)
             self.build_rows()
             self.tick()
 
@@ -941,6 +1053,7 @@ def run_gui():
                 "mixdown": self.mix_var.get(),
                 "split_minutes": self.split_minutes(),
                 "stop_after_minutes": self.stop_after_minutes(),
+                "preroll_seconds": self.preroll_seconds(),
                 "out": self.out_var.get(),
                 "monitor_mic": mon.mic.name if mon else None,
                 "monitor_out": sd.query_devices(out)["name"]
@@ -959,6 +1072,12 @@ def run_gui():
                 return max(0, float(self.split_var.get()))
             except ValueError:
                 return 0
+
+        def preroll_seconds(self):
+            try:
+                return min(30.0, max(0.0, float(self.preroll_var.get())))
+            except ValueError:
+                return 0.0
 
         def stop_after_minutes(self):
             try:
@@ -1105,6 +1224,24 @@ def run_gui():
                 return
             self.add_marker()
 
+        def pause_key(self, event):
+            if isinstance(event.widget, (tk.Entry, ttk.Entry)):
+                return
+            self.toggle_pause()
+
+        def toggle_pause(self):
+            if not self.session:
+                return
+            if self.session.paused:
+                self.session.resume()
+                self.pause_btn.config(text="Pause (P)")
+                self.status.config(text="Recording resumed.")
+            else:
+                self.session.pause()
+                self.pause_btn.config(text="Resume (P)")
+                self.status.config(text="Paused. Nothing is being recorded "
+                                        "until you resume.")
+
         def add_marker(self):
             if not self.session:
                 return
@@ -1136,7 +1273,7 @@ def run_gui():
                                 "drive. Free up space or pick another folder.")
                 return
             try:
-                session.start()
+                session.start(self.preroll_seconds())
             except Exception as e:
                 session.stop()
                 messagebox.showerror("MultiMic", f"Could not start:\n{e}")
@@ -1156,6 +1293,7 @@ def run_gui():
             self.set_locked(False)
             self.rec_btn.config(text="●  Record", bg="#c22",
                                 activebackground="#e33")
+            self.clock.config(text=fmt_time(session.position), foreground="")
             drops = sum(m.overflows for m in session.mics)
             clips = sum(m.clips for m in session.mics)
             msg = f"Saved {len(session.mics)} mic(s) to {session.folder}"
@@ -1180,9 +1318,11 @@ def run_gui():
                         self.mix_box):
                 box.config(state=state)
             for w in (self.split_box, self.stop_after_box, self.name_entry,
-                      self.refresh_btn):
+                      self.preroll_box, self.refresh_btn):
                 w.config(state="disabled" if locked else "normal")
-            self.marker_btn.config(state="normal" if locked else "disabled")
+            for w in (self.marker_btn, self.pause_btn):
+                w.config(state="normal" if locked else "disabled")
+            self.pause_btn.config(text="Pause (P)")
             for r in self.rows:
                 r.set_locked(locked)
 
@@ -1208,11 +1348,17 @@ def run_gui():
                 self.stop("Stopped: the disk is nearly full")
 
         def tick(self):
+            preroll = self.preroll_seconds()
             for r in self.rows:
+                r.mic.ring_seconds = preroll
                 r.update()
             if self.session:
                 elapsed = self.session.elapsed
-                self.clock.config(text=fmt_time(elapsed))
+                paused = self.session.paused
+                blink = paused and (self._ticks // 10) % 2
+                self.clock.config(
+                    text=" " * 8 if blink else fmt_time(elapsed),
+                    foreground="#c80" if paused else "")
                 limit = self.stop_after_minutes()
                 if limit and elapsed >= limit * 60:
                     self.stop(f"Stopped automatically after "

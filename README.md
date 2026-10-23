@@ -36,7 +36,12 @@ To build the exe yourself, double-click `build_exe.bat`.
   (`session_2026-10-23_20-00-00_Episode 12`).
 - **Stop automatically after N min:** handy for timed takes or overnight
   recordings.
+- **Pre-record N s:** keeps the last few seconds (up to 30) in memory, so
+  when you press Record the files also include what was said just before.
 - Press **Record** (or Space) to start and again to stop.
+- **Pause (P):** pauses and resumes every mic at the same instant. The paused
+  stretch is left out of all files, so they stay in sync. The clock blinks
+  orange while paused.
 - **Markers:** press **M** (or the Marker button) while recording to mark a
   moment. They're saved as `markers.txt` (import into Audacity with
   *File > Import > Labels*, or into Reaper) and `markers.csv`, which also
@@ -91,6 +96,9 @@ The tests need no audio hardware.
   controllers, and avoid unpowered hubs.
 - Mixdown needs every mic at the same sample rate. Pick a fixed rate
   (48000 is the default), not "Device default".
+- Start, pause, resume and stop happen at the same sample position on every
+  mic, using the timestamps the audio driver reports (or an estimate from
+  the latency when it doesn't).
 - Each USB mic has its own clock, so over long takes (an hour or more) the
   files can drift apart by a few tens of milliseconds. For long sessions where
   sync has to be perfect, use one multi-input audio interface instead.
