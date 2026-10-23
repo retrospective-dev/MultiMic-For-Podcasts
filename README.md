@@ -3,12 +3,19 @@
 Records several USB microphones at the same time on Windows. Each mic gets its
 own file, and all files start at the same moment.
 
-## Run
+## Get it
+
+**Ready-made exe:** every push to `main` builds `MultiMic.exe` on GitHub.
+Open the repo's **Actions** tab, click the latest *Build* run and download
+the **MultiMic** artifact. Tagged versions (`v1.0` and so on) also attach the
+exe to a **Release**.
+
+**From source:**
 
 1. Install Python 3.9+ from python.org (tick "Add Python to PATH").
 2. Double-click `run.bat`. The first launch installs the libraries.
 
-To build a standalone `MultiMic.exe`, double-click `build_exe.bat`.
+To build the exe yourself, double-click `build_exe.bat`.
 
 ## Use
 
@@ -25,13 +32,34 @@ To build a standalone `MultiMic.exe`, double-click `build_exe.bat`.
 - **New file every N min:** splits long recordings into `_part01`, `_part02`,
   and so on, with all mics split at the same point. WAV files also split
   automatically before reaching the 4 GB WAV limit.
+- **Session name:** optional, added to the folder name
+  (`session_2026-10-23_20-00-00_Episode 12`).
+- **Stop automatically after N min:** handy for timed takes or overnight
+  recordings.
 - Press **Record** (or Space) to start and again to stop.
+- **Markers:** press **M** (or the Marker button) while recording to mark a
+  moment. They're saved as `markers.txt` (import into Audacity with
+  *File > Import > Labels*, or into Reaper) and `markers.csv`, which also
+  says which split part each marker falls in.
+
+Each mic's status shows warnings in red:
+
+- **CLIP xN:** the mic hit full scale N times. Turn its gain down.
+- **NO SIGNAL:** the mic stopped sending audio, usually because it was
+  unplugged or the USB link dropped.
+- **drops:** audio buffers were lost (see Tips).
+
+The bottom right shows free disk space and roughly how much recording time
+is left. If the drive gets nearly full (under 200 MB), recording stops on its
+own so the files already written stay intact.
 
 Files go to `<output>\session_YYYY-MM-DD_HH-MM-SS\`:
 
     00_mixdown.wav       (if mixdown is on)
     01_Host.wav
     02_Guest.wav
+    markers.txt          (if you added markers)
+    markers.csv
 
 Everything you set (mics ticked, names, gain, mute, folder, format and so on)
 is remembered for next time in `%APPDATA%\MultiMic\settings.json`.
@@ -39,10 +67,18 @@ is remembered for next time in `%APPDATA%\MultiMic\settings.json`.
 ## Command line
 
     python multimic.py --list
-    python multimic.py -d 3 7 -n Host Guest -m stereo -s 30 -t 3600
+    python multimic.py -d 3 7 -n Host Guest --name "Ep 12" -m stereo -s 30 -t 3600
 
-`-d` devices, `-n` names, `-m off|stereo|multitrack` mixdown,
-`-s` minutes per file, `-t` stop after N seconds. See `--help`.
+`-d` devices, `-n` mic names, `--name` session name,
+`-m off|stereo|multitrack` mixdown, `-s` minutes per file,
+`-t` stop after N seconds. Press **M** for a marker. See `--help`.
+
+## Tests
+
+    pip install numpy soundfile pytest
+    pytest tests
+
+The tests need no audio hardware.
 
 ## Tips
 

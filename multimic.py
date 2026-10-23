@@ -19,6 +19,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
@@ -43,6 +44,10 @@ MIX_MODES = {
 }
 HOSTAPI_PREFERENCE = ["Windows WASAPI", "MME", "Windows DirectSound"]
 GAIN_RANGE = 24  # dB, either way
+CLIP_LEVEL = 0.999
+NO_SIGNAL_AFTER = 1.5  # seconds without audio callbacks
+DISK_STOP_BYTES = 200_000_000  # stop recording before the disk is full
+FLAC_RATIO = 0.6  # rough FLAC size vs. PCM, for time-left estimates
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +127,41 @@ def wasapi_resample(hostapi_name, samplerate, device_rate):
 def safe_name(name):
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
     return name[:80] or "mic"
+
+
+def data_rate(mics, format_name, mix_mode=None):
+    """Bytes per second a recording of these (open) mics will write."""
+    fmt, subtype, _ = FORMATS[format_name]
+    width = BYTES_PER_SAMPLE[subtype]
+    rate = sum(m.stream.samplerate * m.stream.channels * width
+               for m in mics if m.stream is not None)
+    if mix_mode and mics and mics[0].stream is not None:
+        ch = 2 if mix_mode == "stereo" else len(mics)
+        rate += mics[0].stream.samplerate * ch * width
+    return rate * (FLAC_RATIO if fmt == "FLAC" else 1)
+
+
+def disk_free(path):
+    """Free bytes on the drive holding path (or its nearest existing
+    parent), or None if it can't be found."""
+    path = os.path.abspath(path)
+    while path and not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
+
+
+def fmt_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 
 class SplitWriter:
@@ -312,6 +352,8 @@ class Mic:
         self.monitor = None
         self.peak = 0.0
         self.overflows = 0
+        self.clips = 0
+        self.last_audio = 0.0
         self.frames_written = 0
         self.error = None
         self._queue = None
@@ -342,7 +384,18 @@ class Mic:
             dtype="float32", latency="high", callback=self._callback,
             extra_settings=wasapi_resample(self.hostapi_name, samplerate,
                                            default_sr))
+        self.last_audio = time.monotonic()
         self.stream.start()
+
+    @property
+    def no_signal(self):
+        """True when the device has stopped delivering audio, which is
+        what an unplugged USB mic looks like."""
+        if self.stream is None:
+            return False
+        if not self.stream.active:
+            return True
+        return time.monotonic() - self.last_audio > NO_SIGNAL_AFTER
 
     def close(self):
         self.stop()
@@ -354,6 +407,7 @@ class Mic:
                 self.stream = None
 
     def _callback(self, indata, frames, time_info, status):
+        self.last_audio = time.monotonic()
         if status.input_overflow:
             self.overflows += 1
         gain = 0.0 if self.muted else self.gain
@@ -362,6 +416,8 @@ class Mic:
             peak = float(np.abs(data).max())
             if peak > self.peak:
                 self.peak = peak
+            if peak >= CLIP_LEVEL and self._start_at is not None:
+                self.clips += 1
         monitor = self.monitor
         if monitor is not None:
             monitor.feed(data)
@@ -385,6 +441,7 @@ class Mic:
     def begin(self, writer, mix=None, slot=0):
         self.frames_written = 0
         self.overflows = 0
+        self.clips = 0
         self.error = None
         self._started = False
         self._start_at = None
@@ -438,15 +495,21 @@ class Session:
     """Starts and stops a group of mics together."""
 
     def __init__(self, mics, out_root, format_name, mix_mode=None,
-                 split_minutes=0):
+                 split_minutes=0, name=""):
         self.mics = mics
+        self.format_name = format_name
         self.fmt, self.subtype, self.ext = FORMATS[format_name]
         self.mix_mode = mix_mode
         self.split_minutes = split_minutes
         self.mix = None
+        self.markers = []
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.folder = os.path.join(out_root, f"session_{stamp}")
+        folder = f"session_{stamp}"
+        if name.strip():
+            folder += "_" + safe_name(name.strip())
+        self.folder = os.path.join(out_root, folder)
         self.started = None
+        self._t0 = None
 
     def _split_frames(self, samplerate):
         if not self.split_minutes:
@@ -483,7 +546,48 @@ class Session:
         # all start writing from the same moment.
         for mic in self.mics:
             mic.arm()
+        self._t0 = self.mics[0]._start_at
         self.started = time.monotonic()
+
+    @property
+    def position(self):
+        """Seconds into the recording, on the first mic's audio clock."""
+        stream = self.mics[0].stream
+        if self._t0 is None or stream is None:
+            return self.elapsed
+        return max(0.0, stream.time - self._t0)
+
+    def add_marker(self, label=None):
+        t = self.position
+        label = label or f"Marker {len(self.markers) + 1}"
+        self.markers.append((t, label))
+        self._write_markers()
+        return t, label
+
+    def _write_markers(self):
+        # Audacity label track (also imports into Reaper and others) plus a
+        # spreadsheet-friendly CSV that knows about split files.
+        split = self.split_minutes * 60
+        try:
+            with open(os.path.join(self.folder, "markers.txt"), "w",
+                      encoding="utf-8") as f:
+                for t, label in self.markers:
+                    f.write(f"{t:.6f}\t{t:.6f}\t{label}\n")
+            with open(os.path.join(self.folder, "markers.csv"), "w",
+                      encoding="utf-8") as f:
+                f.write("number,time,seconds,part,time_in_part,label\n")
+                for n, (t, label) in enumerate(self.markers, 1):
+                    part = int(t // split) + 1 if split else 1
+                    in_part = t - (part - 1) * split if split else t
+                    label = '"' + label.replace('"', '""') + '"'
+                    f.write(f"{n},{fmt_time(t, True)},{t:.3f},{part},"
+                            f"{fmt_time(in_part, True)},{label}\n")
+        except OSError:
+            pass
+
+    @property
+    def data_rate(self):
+        return data_rate(self.mics, self.format_name, self.mix_mode)
 
     def stop(self):
         for mic in self.mics:
@@ -505,9 +609,18 @@ class Session:
         return time.monotonic() - self.started if self.started else 0.0
 
 
-def fmt_time(seconds):
+def fmt_time(seconds, millis=False):
     s = int(seconds)
-    return f"{s // 3600:02d}:{s // 60 % 60:02d}:{s % 60:02d}"
+    text = f"{s // 3600:02d}:{s // 60 % 60:02d}:{s % 60:02d}"
+    if millis:
+        text += f".{int(round((seconds - s) * 1000)) % 1000:03d}"
+    return text
+
+
+def fmt_duration(seconds):
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f} h"
+    return f"{max(0, seconds) / 60:.0f} min"
 
 
 def to_db(peak):
@@ -578,7 +691,7 @@ def run_gui():
                                                    fill="#3c3", width=0)
             self.db = ttk.Label(parent, width=8, anchor="e")
             self.db.grid(row=row, column=8, padx=4)
-            self.info = ttk.Label(parent, width=24)
+            self.info = ttk.Label(parent, width=30)
             self.info.grid(row=row, column=9, sticky="w", padx=4)
 
             if saved.get("enabled"):
@@ -649,13 +762,21 @@ def run_gui():
             if not mic.is_open:
                 return
             text = f"{int(mic.stream.samplerate)} Hz"
+            warn = False
             if mic.is_recording:
                 text += f"  {fmt_time(mic.seconds)}"
+            if mic.clips:
+                text += f"  CLIP x{mic.clips}"
+                warn = True
             if mic.overflows:
                 text += f"  drops:{mic.overflows}"
+            if mic.no_signal:
+                text = "NO SIGNAL - unplugged?"
+                warn = True
             if mic.error:
                 text = f"ERROR: {mic.error}"
-            self.info.config(text=text)
+                warn = True
+            self.info.config(text=text, foreground="#c00" if warn else "")
 
     class App:
         def __init__(self, root):
@@ -732,6 +853,24 @@ def run_gui():
             ttk.Button(out, text="Open folder", command=self.open_folder).pack(
                 side="left", padx=(4, 0))
 
+            opts = ttk.Frame(root, padding=(8, 0, 8, 0))
+            opts.pack(fill="x")
+            ttk.Label(opts, text="Session name:").pack(side="left")
+            self.name_var = tk.StringVar()
+            self.name_entry = ttk.Entry(opts, width=28,
+                                        textvariable=self.name_var)
+            self.name_entry.pack(side="left", padx=4)
+            ttk.Label(opts, text="(optional, added to the folder name)",
+                      foreground="#666").pack(side="left")
+            ttk.Label(opts, text="min (0 = off)").pack(side="right")
+            self.stop_after_var = tk.StringVar(
+                value=str(s.get("stop_after_minutes", 0)))
+            self.stop_after_box = ttk.Spinbox(
+                opts, from_=0, to=1440, increment=5, width=5,
+                textvariable=self.stop_after_var)
+            self.stop_after_box.pack(side="right", padx=4)
+            ttk.Label(opts, text="Stop automatically after").pack(side="right")
+
             bottom = ttk.Frame(root, padding=8)
             bottom.pack(fill="x")
             ttk.Label(bottom, text="Format:").pack(side="left")
@@ -764,14 +903,25 @@ def run_gui():
                                      font=("Segoe UI", 11, "bold"),
                                      command=self.toggle_record)
             self.rec_btn.pack(side="right")
+            self.marker_btn = ttk.Button(bottom, text="Marker (M)",
+                                         state="disabled",
+                                         command=self.add_marker)
+            self.marker_btn.pack(side="right", padx=(8, 4))
             self.clock = ttk.Label(bottom, text="00:00:00",
                                    font=("Consolas", 16))
             self.clock.pack(side="right", padx=12)
-            self.status = ttk.Label(root, text="Tick the microphones to use.",
-                                    padding=(8, 0, 8, 8))
-            self.status.pack(fill="x")
+            status_bar = ttk.Frame(root, padding=(8, 0, 8, 8))
+            status_bar.pack(fill="x")
+            self.disk = ttk.Label(status_bar)
+            self.disk.pack(side="right")
+            self.status = ttk.Label(status_bar,
+                                    text="Tick the microphones to use.")
+            self.status.pack(side="left", fill="x", expand=True)
+            self._ticks = 0
 
             root.bind("<space>", self.space)
+            root.bind("<Key-m>", self.marker_key)
+            root.bind("<Key-M>", self.marker_key)
             self.build_rows()
             self.tick()
 
@@ -790,6 +940,7 @@ def run_gui():
                 "format": self.fmt_var.get(),
                 "mixdown": self.mix_var.get(),
                 "split_minutes": self.split_minutes(),
+                "stop_after_minutes": self.stop_after_minutes(),
                 "out": self.out_var.get(),
                 "monitor_mic": mon.mic.name if mon else None,
                 "monitor_out": sd.query_devices(out)["name"]
@@ -806,6 +957,12 @@ def run_gui():
         def split_minutes(self):
             try:
                 return max(0, float(self.split_var.get()))
+            except ValueError:
+                return 0
+
+        def stop_after_minutes(self):
+            try:
+                return max(0, float(self.stop_after_var.get()))
             except ValueError:
                 return 0
 
@@ -943,6 +1100,17 @@ def run_gui():
                 return
             self.toggle_record()
 
+        def marker_key(self, event):
+            if isinstance(event.widget, (tk.Entry, ttk.Entry)):
+                return
+            self.add_marker()
+
+        def add_marker(self):
+            if not self.session:
+                return
+            t, label = self.session.add_marker()
+            self.status.config(text=f"{label} at {fmt_time(t, True)}")
+
         def toggle_record(self):
             if self.session:
                 self.stop()
@@ -960,7 +1128,13 @@ def run_gui():
             session = Session([r.mic for r in rows], self.out_var.get(),
                               self.fmt_var.get(),
                               MIX_MODES[self.mix_var.get()],
-                              self.split_minutes())
+                              self.split_minutes(), self.name_var.get())
+            free = disk_free(self.out_var.get())
+            if free is not None and free < DISK_STOP_BYTES:
+                messagebox.showerror(
+                    "MultiMic", f"Only {fmt_bytes(free)} free on the output "
+                                "drive. Free up space or pick another folder.")
+                return
             try:
                 session.start()
             except Exception as e:
@@ -974,38 +1148,78 @@ def run_gui():
                                 activebackground="#555")
             self.status.config(text=f"Recording {len(rows)} mic(s) to "
                                     f"{session.folder}")
+            self.update_disk()
 
-        def stop(self):
+        def stop(self, reason=""):
             session, self.session = self.session, None
             session.stop()
             self.set_locked(False)
             self.rec_btn.config(text="●  Record", bg="#c22",
                                 activebackground="#e33")
             drops = sum(m.overflows for m in session.mics)
+            clips = sum(m.clips for m in session.mics)
             msg = f"Saved {len(session.mics)} mic(s) to {session.folder}"
             if session.mix is not None:
                 msg += " (+ mixdown)"
+            if session.markers:
+                msg += f", {len(session.markers)} marker(s)"
+            if clips:
+                msg += "  - some mics clipped, turn their gain down"
             if drops:
                 msg += f"  ({drops} buffer drop(s) - try fewer mics per USB hub)"
             if session.errors:
                 msg = "Errors: " + "; ".join(session.errors)
+            if reason:
+                msg = f"{reason}. {msg}"
             self.status.config(text=msg)
+            self.update_disk()
 
         def set_locked(self, locked):
             state = "disabled" if locked else "readonly"
             for box in (self.api_box, self.sr_box, self.fmt_box,
                         self.mix_box):
                 box.config(state=state)
-            self.split_box.config(state="disabled" if locked else "normal")
-            self.refresh_btn.config(state="disabled" if locked else "normal")
+            for w in (self.split_box, self.stop_after_box, self.name_entry,
+                      self.refresh_btn):
+                w.config(state="disabled" if locked else "normal")
+            self.marker_btn.config(state="normal" if locked else "disabled")
             for r in self.rows:
                 r.set_locked(locked)
+
+        def update_disk(self):
+            free = disk_free(self.out_var.get())
+            if free is None:
+                self.disk.config(text="")
+                return
+            if self.session:
+                rate = self.session.data_rate
+            else:
+                rate = data_rate([r.mic for r in self.rows if r.mic.is_open],
+                                 self.fmt_var.get(),
+                                 MIX_MODES[self.mix_var.get()])
+            text = f"Disk: {fmt_bytes(free)} free"
+            low = False
+            if rate:
+                left = (free - DISK_STOP_BYTES) / rate
+                text += f" (~{fmt_duration(left)} of recording)"
+                low = left < 600
+            self.disk.config(text=text, foreground="#c00" if low else "")
+            if self.session and free < DISK_STOP_BYTES:
+                self.stop("Stopped: the disk is nearly full")
 
         def tick(self):
             for r in self.rows:
                 r.update()
             if self.session:
-                self.clock.config(text=fmt_time(self.session.elapsed))
+                elapsed = self.session.elapsed
+                self.clock.config(text=fmt_time(elapsed))
+                limit = self.stop_after_minutes()
+                if limit and elapsed >= limit * 60:
+                    self.stop(f"Stopped automatically after "
+                              f"{fmt_time(limit * 60)}")
+            self._ticks += 1
+            if self._ticks % 40 == 0:  # every 2 s
+                self.update_disk()
             self.root.after(50, self.tick)
 
         def quit(self):
@@ -1060,12 +1274,22 @@ def run_cli(args, api):
         mic.open(args.samplerate, args.channels)
         mics.append(mic)
     session = Session(mics, args.out, args.format,
-                      None if args.mix == "off" else args.mix, args.split)
+                      None if args.mix == "off" else args.mix, args.split,
+                      args.name or "")
     session.start()
+    try:
+        import msvcrt  # Windows: read single key presses for markers
+    except ImportError:
+        msvcrt = None
     print(f"Recording {len(mics)} mic(s) to {session.folder}. "
-          "Press Ctrl+C to stop.")
+          + ("Press M for a marker, " if msvcrt else "")
+          + "Ctrl+C to stop.")
     try:
         while args.seconds is None or session.elapsed < args.seconds:
+            while msvcrt and msvcrt.kbhit():
+                if msvcrt.getwch().lower() == "m":
+                    t, label = session.add_marker()
+                    print(f"\n{label} at {fmt_time(t, True)}")
             levels = "  ".join(f"{m.label[:12]} {to_db(m.peak):6.1f}dB"
                                for m in mics)
             for m in mics:
@@ -1093,6 +1317,7 @@ def main():
                    help="device numbers to record (command-line mode)")
     p.add_argument("-n", "--names", nargs="+",
                    help="a name per device, used for the file names")
+    p.add_argument("--name", help="session name, added to the folder name")
     p.add_argument("--api", type=int, help="audio API number "
                    "(default: WASAPI on Windows)")
     p.add_argument("-o", "--out", default=os.path.join(
