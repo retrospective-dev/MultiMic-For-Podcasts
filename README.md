@@ -12,28 +12,49 @@ To build a standalone `MultiMic.exe`, double-click `build_exe.bat`.
 
 ## Use
 
-- Tick each mic you want. Its level meter starts moving right away, so you
-  can check gain before recording.
-- Pick the sample rate (48000 recommended, all mics will match), format and
-  output folder.
-- Press **Record** (or Space). Press again to stop.
-- Files go to `<output>\session_YYYY-MM-DD_HH-MM-SS\01_<mic name>.wav`, ...
+- **Pick mics:** tick each mic you want. Its level meter starts moving right
+  away, so you can check levels before recording.
+- **Name them:** type a name ("Host", "Guest 1"). It's used for the file name.
+- **Gain / Mute:** the slider boosts or cuts each mic by up to 24 dB
+  (double-click to reset to 0). Muted mics record silence, so files stay in
+  sync. Meters show the level after gain, which is what gets recorded.
+- **Listen to:** choose a mic and an output (e.g. your headphones) to monitor
+  it live.
+- **Mixdown:** also save a combined file. *Stereo mix* sums every mic into
+  one stereo file. *Multitrack* writes one file with one channel per mic.
+- **New file every N min:** splits long recordings into `_part01`, `_part02`,
+  and so on, with all mics split at the same point. WAV files also split
+  automatically before reaching the 4 GB WAV limit.
+- Press **Record** (or Space) to start and again to stop.
 
-Command line also works:
+Files go to `<output>\session_YYYY-MM-DD_HH-MM-SS\`:
+
+    00_mixdown.wav       (if mixdown is on)
+    01_Host.wav
+    02_Guest.wav
+
+Everything you set (mics ticked, names, gain, mute, folder, format and so on)
+is remembered for next time in `%APPDATA%\MultiMic\settings.json`.
+
+## Command line
 
     python multimic.py --list
-    python multimic.py -d 3 7 9 -t 60      # record devices 3, 7, 9 for 60 s
+    python multimic.py -d 3 7 -n Host Guest -m stereo -s 30 -t 3600
+
+`-d` devices, `-n` names, `-m off|stereo|multitrack` mixdown,
+`-s` minutes per file, `-t` stop after N seconds. See `--help`.
 
 ## Tips
 
-- Keep the **Windows WASAPI** audio API (the default). MME shows names cut off
+- Keep the **Windows WASAPI** audio API (the default). MME cuts names off
   at 31 characters, and its latency is higher.
 - Identical mics show up as "Microphone (USB Audio)" and
-  "Microphone (2- USB Audio)". Tap each one and watch which meter moves.
+  "Microphone (2- USB Audio)". Tap each one and watch which meter moves, then
+  give them names. Settings are remembered by these Windows names.
 - "drops" means a buffer was lost. Spread mics across different USB ports or
   controllers, and avoid unpowered hubs.
+- Mixdown needs every mic at the same sample rate. Pick a fixed rate
+  (48000 is the default), not "Device default".
 - Each USB mic has its own clock, so over long takes (an hour or more) the
   files can drift apart by a few tens of milliseconds. For long sessions where
   sync has to be perfect, use one multi-input audio interface instead.
-- A WAV file tops out at 4 GB (about 4 hours of 48 kHz/24-bit stereo per mic).
-  Use FLAC for longer takes.
