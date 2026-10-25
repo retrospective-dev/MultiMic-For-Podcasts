@@ -3,6 +3,10 @@
 Records several USB microphones at the same time on Windows. Each mic gets its
 own file, and all files start at the same moment.
 
+A dark, Windows 11-style window: one card per mic with a live LED level meter,
+gain and mute, a big record button and clock up top, and every setting in the
+side panel.
+
 ## Get it
 
 **Ready-made exe:** every push to `main` builds `MultiMic.exe` on GitHub.
@@ -19,7 +23,7 @@ To build the exe yourself, double-click `build_exe.bat`.
 
 ## Use
 
-- **Pick mics:** tick each mic you want. Its level meter starts moving right
+- **Pick mics:** switch on each mic you want. Its level meter starts moving right
   away, so you can check levels before recording.
 - **Name them:** type a name ("Host", "Guest 1"). It's used for the file name.
 - **Gain / Mute:** the slider boosts or cuts each mic by up to 24 dB
@@ -38,7 +42,7 @@ To build the exe yourself, double-click `build_exe.bat`.
   recordings.
 - **Pre-record N s:** keeps the last few seconds (up to 30) in memory, so
   when you press Record the files also include what was said just before.
-- Press **Record** (or Space) to start and again to stop.
+- Press the round **record button** (or Space) to start, and again to stop.
 - **Pause (P):** pauses and resumes every mic at the same instant. The paused
   stretch is left out of all files, so they stay in sync. The clock blinks
   orange while paused.

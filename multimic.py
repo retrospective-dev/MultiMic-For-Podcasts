@@ -729,68 +729,261 @@ def to_db(peak):
 # GUI
 # ---------------------------------------------------------------------------
 
+def resource_path(name):
+    """A file shipped next to the script, or inside the PyInstaller exe."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
 def run_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
+    from tkinter import font as tkfont
 
-    METER_W, METER_H = 180, 14
+    BG = "#1c1c1c"
+    FG = "#fafafa"
+    DIM = "#9a9a9a"
+    FAINT = "#5a5a5a"
+    RED = "#e5484d"
+    RED_HOT = "#ff6369"
+    AMBER = "#ffb224"
+    GREEN = "#3ddc84"
+    YELLOW = "#ffd23f"
+    WARN = "#ff6b6b"
+
+    def blend(color, into, amount):
+        a = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+        b = [int(into[i:i + 2], 16) for i in (1, 3, 5)]
+        return "#" + "".join(f"{round(x + (y - x) * amount):02x}"
+                             for x, y in zip(a, b))
+
+    class Meter(tk.Canvas):
+        """Segmented LED level meter with a peak-hold marker."""
+
+        SEG, GAP, FLOOR = 5, 2, -60.0
+
+        def __init__(self, parent, height=16):
+            super().__init__(parent, height=height, bg=BG,
+                             highlightthickness=0, width=200)
+            self.lit_ids, self.colors = [], []
+            self.lit = -1
+            self.peak_db = self.FLOOR
+            self.peak_time = 0.0
+            self.bind("<Configure>", lambda e: self._draw())
+
+        def _color(self, i, n):
+            db = self.FLOOR * (1 - (i + 0.5) / n)
+            return RED if db > -3 else YELLOW if db > -12 else GREEN
+
+        def _draw(self):
+            self.delete("all")
+            w, h = self.winfo_width(), self.winfo_height()
+            n = max(10, (w + self.GAP) // (self.SEG + self.GAP))
+            self.lit_ids, self.colors = [], []
+            for i in range(n):
+                x = i * (self.SEG + self.GAP)
+                c = self._color(i, n)
+                self.create_rectangle(x, 0, x + self.SEG, h, width=0,
+                                      fill=blend(c, BG, 0.82))
+                self.lit_ids.append(self.create_rectangle(
+                    x, 0, x + self.SEG, h, width=0, fill=c, state="hidden"))
+                self.colors.append(c)
+            self.peak_id = self.create_rectangle(0, 0, 0, h, width=0,
+                                                 fill=FG, state="hidden")
+            self.lit = 0
+
+        def set(self, db, active=True):
+            n = len(self.lit_ids)
+            if not n:
+                return
+            frac = min(1.0, max(0.0, (db - self.FLOOR) / -self.FLOOR))
+            lit = int(round(frac * n)) if active else 0
+            if lit != self.lit:
+                lo, hi = sorted((lit, self.lit))
+                for i in range(lo, hi):
+                    self.itemconfig(self.lit_ids[i],
+                                    state="normal" if i < lit else "hidden")
+                self.lit = lit
+            now = time.monotonic()
+            if db >= self.peak_db or now - self.peak_time > 1.5:
+                self.peak_db = db
+                self.peak_time = now
+            pfrac = (self.peak_db - self.FLOOR) / -self.FLOOR
+            i = min(n - 1, int(pfrac * n))
+            if active and pfrac > 0.02:
+                x = i * (self.SEG + self.GAP)
+                self.coords(self.peak_id, x, 0, x + self.SEG,
+                            self.winfo_height())
+                self.itemconfig(self.peak_id, state="normal",
+                                fill=blend(self.colors[i], "#ffffff", 0.5))
+            else:
+                self.itemconfig(self.peak_id, state="hidden")
+
+    class RecordButton(tk.Canvas):
+        """Big round record / stop button."""
+
+        def __init__(self, parent, command, size=64):
+            super().__init__(parent, width=size, height=size, bg=BG,
+                             highlightthickness=0, cursor="hand2")
+            self.size, self.command = size, command
+            self.recording = self.hover = False
+            self.pulse = 0
+            self.bind("<Button-1>", lambda e: self.command())
+            self.bind("<Enter>", lambda e: self._set_hover(True))
+            self.bind("<Leave>", lambda e: self._set_hover(False))
+            self._draw()
+
+        def _set_hover(self, on):
+            self.hover = on
+            self._draw()
+
+        def set_recording(self, on):
+            self.recording = on
+            self._draw()
+
+        def tick(self, paused):
+            if self.recording:
+                self.pulse = (self.pulse + 1) % 40
+                self._draw(paused)
+
+        def _draw(self, paused=False):
+            self.delete("all")
+            s, pad = self.size, 3
+            ring = "#3a3a3a"
+            if self.recording:
+                glow = abs(20 - self.pulse) / 20
+                ring = AMBER if paused else blend(RED, "#3a3a3a", glow * 0.7)
+            self.create_oval(pad, pad, s - pad, s - pad, outline=ring,
+                             width=3)
+            fill = RED_HOT if self.hover else RED
+            if self.recording:
+                q = s * 0.33
+                self._round_rect(q, q, s - q, s - q, 5, fill)
+            else:
+                q = s * 0.24
+                self.create_oval(q, q, s - q, s - q, fill=fill, width=0)
+
+        def _round_rect(self, x1, y1, x2, y2, r, fill):
+            pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r,
+                   x2, y2, x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r,
+                   x1, y1 + r, x1, y1]
+            self.create_polygon(pts, smooth=True, fill=fill, width=0)
+
+    class ScrollFrame(ttk.Frame):
+        """A vertically scrolling container for the mic cards."""
+
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
+            self.bar = ttk.Scrollbar(self, orient="vertical",
+                                     command=self.canvas.yview)
+            self.inner = ttk.Frame(self.canvas)
+            self.win = self.canvas.create_window((0, 0), window=self.inner,
+                                                 anchor="nw")
+            self.canvas.configure(yscrollcommand=self.bar.set)
+            self.canvas.pack(side="left", fill="both", expand=True)
+            self.inner.bind("<Configure>", lambda e: self._refresh())
+            self.canvas.bind("<Configure>", lambda e: (
+                self.canvas.itemconfig(self.win, width=e.width),
+                self._refresh()))
+            self.canvas.bind_all("<MouseWheel>", self._wheel)
+            self.canvas.bind_all("<Button-4>", self._wheel)
+            self.canvas.bind_all("<Button-5>", self._wheel)
+
+        def _refresh(self):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            needed = self.inner.winfo_reqheight() > self.canvas.winfo_height()
+            if needed and not self.bar.winfo_ismapped():
+                self.bar.pack(side="right", fill="y", before=self.canvas)
+            elif not needed and self.bar.winfo_ismapped():
+                self.bar.pack_forget()
+                self.canvas.yview_moveto(0)
+
+        def _wheel(self, event):
+            w = event.widget
+            while w is not None and w is not self:
+                w = getattr(w, "master", None)
+            if w is None or self.inner.winfo_reqheight() <= \
+                    self.canvas.winfo_height():
+                return
+            if getattr(event, "num", 0) == 4:
+                step = -1
+            elif getattr(event, "num", 0) == 5:
+                step = 1
+            else:
+                step = -1 if event.delta > 0 else 1
+            self.canvas.yview_scroll(step * 2, "units")
 
     class MicRow:
+        """One microphone card."""
+
         def __init__(self, app, parent, row, mic, saved):
             self.app = app
             self.mic = mic
             self.held = 0.0
+            card = self.card = ttk.Frame(parent, style="Card.TFrame",
+                                         padding=(14, 10, 14, 12))
+            card.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+            card.columnconfigure(2, weight=1)
+
             self.var = tk.BooleanVar(value=False)
-            self.cb = ttk.Checkbutton(parent, variable=self.var,
+            self.cb = ttk.Checkbutton(card, style="Switch.TCheckbutton",
+                                      variable=self.var,
                                       command=self.toggled)
-            self.cb.grid(row=row, column=0, padx=4, pady=3)
-
+            self.cb.grid(row=0, column=0, sticky="w")
             self.label_var = tk.StringVar(value=saved.get("label", mic.name))
-            self.label_entry = ttk.Entry(parent, width=16,
-                                         textvariable=self.label_var)
-            self.label_entry.grid(row=row, column=1, padx=4, sticky="we")
+            self.label_entry = ttk.Entry(card, width=22,
+                                         textvariable=self.label_var,
+                                         font=app.f_bold)
+            self.label_entry.grid(row=0, column=1, sticky="w", padx=(4, 12))
+            dev = mic.name if len(mic.name) < 48 else mic.name[:46] + "…"
+            ttk.Label(card, text=dev, foreground=DIM,
+                      font=app.f_small).grid(row=0, column=2, sticky="w")
+            self.info = ttk.Label(card, font=app.f_small, anchor="e")
+            self.info.grid(row=0, column=3, sticky="e")
 
-            dev = f"[{mic.index}] {mic.name}"
-            ttk.Label(parent, text=dev if len(dev) < 42 else dev[:40] + "…",
-                      foreground="#666").grid(row=row, column=2, sticky="w",
-                                              padx=4)
+            meter_row = ttk.Frame(card)
+            meter_row.grid(row=1, column=0, columnspan=4, sticky="ew",
+                           pady=(10, 8))
+            meter_row.columnconfigure(0, weight=1)
+            self.meter = Meter(meter_row)
+            self.meter.grid(row=0, column=0, sticky="ew")
+            self.db = ttk.Label(meter_row, width=9, anchor="e",
+                                font=app.f_mono)
+            self.db.grid(row=0, column=1, padx=(10, 0))
+
+            ctl = ttk.Frame(card)
+            ctl.grid(row=2, column=0, columnspan=4, sticky="ew")
+            ttk.Label(ctl, text="Gain", foreground=DIM).pack(side="left")
+            gain_db = float(saved.get("gain_db", 0))
+            gain_db = max(-GAIN_RANGE, min(GAIN_RANGE, gain_db))
+            self.gain_var = tk.DoubleVar(value=gain_db)
+            self.gain = ttk.Scale(ctl, from_=-GAIN_RANGE, to=GAIN_RANGE,
+                                  length=180, variable=self.gain_var,
+                                  command=lambda v: self.gain_changed())
+            self.gain.pack(side="left", padx=(8, 6))
+            self.gain.bind("<Double-Button-1>", lambda e: self.reset_gain())
+            self.gain_lbl = ttk.Label(ctl, width=7, font=app.f_mono)
+            self.gain_lbl.pack(side="left")
+            self.gain_changed()
+
+            self.mute_var = tk.BooleanVar(value=bool(saved.get("muted")))
+            ttk.Checkbutton(ctl, text="Mute", style="Toggle.TButton",
+                            variable=self.mute_var, width=6,
+                            command=self.mute_changed).pack(side="left",
+                                                            padx=(12, 0))
+            self.mute_changed()
 
             chans = mic.info["max_input_channels"]
             want = int(saved.get("channels", 2))
             self.ch_var = tk.StringVar(value=str(max(1, min(want, chans))))
             self.ch_box = ttk.Combobox(
-                parent, width=3, state="readonly", textvariable=self.ch_var,
+                ctl, width=3, state="readonly", textvariable=self.ch_var,
                 values=[str(c) for c in range(1, chans + 1)])
-            self.ch_box.grid(row=row, column=3, padx=4)
+            self.ch_box.pack(side="right")
             self.ch_box.bind("<<ComboboxSelected>>", lambda e: self.reopen())
-
-            gain_db = float(saved.get("gain_db", 0))
-            gain_db = max(-GAIN_RANGE, min(GAIN_RANGE, gain_db))
-            self.gain_var = tk.DoubleVar(value=gain_db)
-            self.gain = ttk.Scale(parent, from_=-GAIN_RANGE, to=GAIN_RANGE,
-                                  length=110, variable=self.gain_var,
-                                  command=lambda v: self.gain_changed())
-            self.gain.grid(row=row, column=4, padx=(4, 0))
-            self.gain.bind("<Double-Button-1>", lambda e: self.reset_gain())
-            self.gain_lbl = ttk.Label(parent, width=7)
-            self.gain_lbl.grid(row=row, column=5)
-            self.gain_changed()
-
-            self.mute_var = tk.BooleanVar(value=bool(saved.get("muted")))
-            ttk.Checkbutton(parent, text="Mute", variable=self.mute_var,
-                            command=self.mute_changed).grid(row=row,
-                                                            column=6, padx=4)
-            self.mute_changed()
-
-            self.meter = tk.Canvas(parent, width=METER_W, height=METER_H,
-                                   bg="#222", highlightthickness=0)
-            self.meter.grid(row=row, column=7, padx=4)
-            self.bar = self.meter.create_rectangle(0, 0, 0, METER_H,
-                                                   fill="#3c3", width=0)
-            self.db = ttk.Label(parent, width=8, anchor="e")
-            self.db.grid(row=row, column=8, padx=4)
-            self.info = ttk.Label(parent, width=30)
-            self.info.grid(row=row, column=9, sticky="w", padx=4)
+            ttk.Label(ctl, text="Channels", foreground=DIM).pack(
+                side="right", padx=(0, 8))
 
             if saved.get("enabled"):
                 self.var.set(True)
@@ -823,8 +1016,8 @@ def run_gui():
                 self.reopen()
             else:
                 self.mic.close()
-                self.info.config(text="")
                 self.app.update_monitor()
+            self.app.update_summary()
 
         def reopen(self, quiet=False):
             if not self.var.get() or self.app.session:
@@ -835,8 +1028,8 @@ def run_gui():
             except Exception as e:
                 self.var.set(False)
                 if quiet:
-                    self.app.status.config(
-                        text=f"Could not open {self.mic.name}: {e}")
+                    self.app.set_status(f"Could not open {self.mic.name}: {e}",
+                                        warn=True)
                 else:
                     messagebox.showerror(
                         "MultiMic", f"Could not open {self.mic.name}:\n{e}")
@@ -852,29 +1045,30 @@ def run_gui():
             peak, mic.peak = mic.peak, 0.0
             self.held = max(peak, self.held * 0.85)
             db = to_db(self.held)
-            frac = min(1.0, max(0.0, (db + 60) / 60))
-            color = "#d33" if db > -1 else "#dc3" if db > -12 else "#3c3"
-            self.meter.coords(self.bar, 0, 0, frac * METER_W, METER_H)
-            self.meter.itemconfig(self.bar, fill=color)
-            self.db.config(text=f"{db:6.1f} dB" if mic.is_open else "")
+            self.meter.set(db, mic.is_open and not mic.muted)
             if not mic.is_open:
+                self.db.config(text="")
+                self.info.config(text="Off", foreground=FAINT)
                 return
-            text = f"{int(mic.stream.samplerate)} Hz"
+            self.db.config(text="muted" if mic.muted else
+                           ("-inf dB" if db <= -120 else f"{db:.1f} dB"))
+            parts = [f"{int(mic.stream.samplerate) // 1000} kHz",
+                     f"{mic.stream.channels} ch"]
             warn = False
             if mic.is_recording:
-                text += f"  {fmt_time(mic.seconds)}"
+                parts.append(fmt_time(mic.seconds))
             if mic.clips:
-                text += f"  CLIP x{mic.clips}"
+                parts.append(f"CLIP ×{mic.clips}")
                 warn = True
             if mic.overflows:
-                text += f"  drops:{mic.overflows}"
+                parts.append(f"{mic.overflows} drops")
+                warn = True
+            text = "  ·  ".join(parts)
             if mic.no_signal:
-                text = "NO SIGNAL - unplugged?"
-                warn = True
+                text, warn = "No signal - unplugged?", True
             if mic.error:
-                text = f"ERROR: {mic.error}"
-                warn = True
-            self.info.config(text=text, foreground="#c00" if warn else "")
+                text, warn = f"Error: {mic.error}", True
+            self.info.config(text=text, foreground=WARN if warn else DIM)
 
     class App:
         def __init__(self, root):
@@ -884,158 +1078,243 @@ def run_gui():
             self.rows = []
             self.outputs = []
             self.settings = load_settings()
+            self._ticks = 0
             s = self.settings
             root.title("MultiMic")
-            root.minsize(1100, 340)
+            root.geometry("1220x800")
+            root.minsize(1000, 560)
+            root.configure(bg=BG)
             root.protocol("WM_DELETE_WINDOW", self.quit)
 
-            top = ttk.Frame(root, padding=8)
-            top.pack(fill="x")
-            ttk.Label(top, text="Audio API:").pack(side="left")
+            fams = set(tkfont.families())
+            ui = next((f for f in ("Segoe UI Variable Text", "Segoe UI",
+                                   "Inter", "DejaVu Sans") if f in fams),
+                      "TkDefaultFont")
+            mono = next((f for f in ("Cascadia Mono", "Consolas",
+                                     "DejaVu Sans Mono") if f in fams),
+                        "TkFixedFont")
+            self.f_title = (ui, 20, "bold")
+            self.f_bold = (ui, 10, "bold")
+            self.f_small = (ui, 9)
+            self.f_head = (ui, 11, "bold")
+            self.f_mono = (mono, 10)
+            self.f_clock = (mono, 34)
+
+            root.columnconfigure(0, weight=1)
+            root.rowconfigure(2, weight=1)
+            self._build_header()
+            self._build_body(s)
+            self._build_status()
+
+            root.bind("<space>", self.space)
+            for key, fn in (("m", self.marker_key), ("p", self.pause_key)):
+                root.bind(f"<Key-{key}>", fn)
+                root.bind(f"<Key-{key.upper()}>", fn)
+            self.build_rows()
+            self.update_summary()
+            self.tick()
+
+        # -- layout ---------------------------------------------------------
+
+        def _build_header(self):
+            head = ttk.Frame(self.root, padding=(24, 18, 24, 14))
+            head.grid(row=0, column=0, sticky="ew")
+            head.columnconfigure(1, weight=1)
+
+            left = ttk.Frame(head)
+            left.grid(row=0, column=0, sticky="w")
+            ttk.Label(left, text="MultiMic", font=self.f_title).pack(
+                anchor="w")
+            self.summary = ttk.Label(left, foreground=DIM)
+            self.summary.pack(anchor="w")
+
+            mid = ttk.Frame(head)
+            mid.grid(row=0, column=1)
+            self.clock = ttk.Label(mid, text="00:00:00", font=self.f_clock)
+            self.clock.pack()
+            self.state = ttk.Label(mid, text="READY", foreground=DIM,
+                                   font=self.f_bold)
+            self.state.pack()
+
+            right = ttk.Frame(head)
+            right.grid(row=0, column=2, sticky="e")
+            self.pause_btn = ttk.Button(right, text="Pause  (P)", width=12,
+                                        state="disabled",
+                                        command=self.toggle_pause)
+            self.pause_btn.pack(side="left", padx=(0, 8))
+            self.marker_btn = ttk.Button(right, text="Marker  (M)", width=12,
+                                         state="disabled",
+                                         command=self.add_marker)
+            self.marker_btn.pack(side="left", padx=(0, 16))
+            self.rec_btn = RecordButton(right, self.toggle_record)
+            self.rec_btn.pack(side="left")
+
+            ttk.Separator(self.root).grid(row=1, column=0, sticky="ew")
+
+        def _build_body(self, s):
+            body = ttk.Frame(self.root, padding=(24, 16, 24, 8))
+            body.grid(row=2, column=0, sticky="nsew")
+            body.columnconfigure(0, weight=1)
+            body.rowconfigure(1, weight=1)
+
+            bar = ttk.Frame(body)
+            bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+            ttk.Label(bar, text="Microphones", font=self.f_head).pack(
+                side="left")
+            ttk.Label(bar, text="Switch on the mics you want to record",
+                      foreground=DIM).pack(side="left", padx=12)
+            self.refresh_btn = ttk.Button(bar, text="⟳  Rescan",
+                                          command=self.rescan)
+            self.refresh_btn.pack(side="right")
+
+            self.scroll = ScrollFrame(body)
+            self.scroll.grid(row=1, column=0, sticky="nsew")
+            self.list_frame = self.scroll.inner
+            self.list_frame.columnconfigure(0, weight=1)
+
+            side = ttk.Frame(body, width=340)
+            side.grid(row=0, column=1, rowspan=2, sticky="nsew",
+                      padx=(20, 0))
+            self._build_sidebar(side, s)
+
+        def _section(self, parent, title, note=None):
+            card = ttk.Frame(parent, style="Card.TFrame",
+                             padding=(14, 8, 14, 10))
+            card.pack(fill="x", pady=(0, 8))
+            card.columnconfigure(1, weight=1)
+            ttk.Label(card, text=title, font=self.f_bold).grid(
+                row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+            if note:
+                ttk.Label(card, text=note, foreground=FAINT,
+                          font=self.f_small).grid(row=0, column=1,
+                                                  columnspan=2, sticky="e",
+                                                  pady=(0, 6))
+            return card
+
+        def _field(self, card, row, label, widget, hint=None):
+            ttk.Label(card, text=label, foreground=DIM).grid(
+                row=row, column=0, sticky="w", pady=3, padx=(0, 12))
+            widget.grid(row=row, column=1, sticky="ew", pady=2)
+            if hint:
+                ttk.Label(card, text=hint, foreground=FAINT,
+                          font=self.f_small).grid(row=row, column=2,
+                                                  sticky="w", padx=(6, 0))
+
+        def _build_sidebar(self, side, s):
+            rec = self._section(side, "Recording")
+            default_out = os.path.join(os.path.expanduser("~"), "Music",
+                                       "MultiMic")
+            self.out_var = tk.StringVar(value=s.get("out", default_out))
+            folder = ttk.Frame(rec)
+            folder.grid(row=1, column=0, columnspan=3, sticky="ew",
+                        pady=(0, 6))
+            ttk.Entry(folder, textvariable=self.out_var).pack(
+                side="left", fill="x", expand=True)
+            ttk.Button(folder, text="…", width=3,
+                       command=self.browse).pack(side="left", padx=(6, 0))
+            ttk.Button(folder, text="Open", width=6,
+                       command=self.open_folder).pack(side="left",
+                                                      padx=(6, 0))
+            self.name_var = tk.StringVar()
+            self.name_entry = ttk.Entry(rec, textvariable=self.name_var)
+            self._field(rec, 3, "Session name", self.name_entry)
+            fmt = s.get("format", "WAV 24-bit")
+            self.fmt_var = tk.StringVar(
+                value=fmt if fmt in FORMATS else "WAV 24-bit")
+            self.fmt_box = ttk.Combobox(rec, state="readonly",
+                                        textvariable=self.fmt_var,
+                                        values=list(FORMATS))
+            self.fmt_box.bind("<<ComboboxSelected>>",
+                              lambda e: self.update_summary())
+            self._field(rec, 4, "Format", self.fmt_box)
+            mix = s.get("mixdown", "Off")
+            self.mix_var = tk.StringVar(value=mix if mix in MIX_MODES
+                                        else "Off")
+            self.mix_box = ttk.Combobox(rec, state="readonly",
+                                        textvariable=self.mix_var,
+                                        values=list(MIX_MODES))
+            self._field(rec, 5, "Mixdown", self.mix_box)
+
+            opt = self._section(side, "Options", "0 = off")
             self.api_var = tk.StringVar()
-            self.api_box = ttk.Combobox(top, state="readonly", width=22,
-                                        textvariable=self.api_var,
-                                        values=hostapis())
             apis = hostapis()
+            self.api_box = ttk.Combobox(opt, state="readonly", width=14,
+                                        textvariable=self.api_var,
+                                        values=apis)
             self.api_box.current(apis.index(s["api"]) if s.get("api") in apis
                                  else preferred_hostapi())
             self.api_box.bind("<<ComboboxSelected>>",
                               lambda e: self.build_rows())
-            self.api_box.pack(side="left", padx=4)
-            ttk.Label(top, text="Sample rate:").pack(side="left", padx=(12, 0))
+            self._field(opt, 1, "Audio driver", self.api_box)
             sr = s.get("samplerate", "48000")
             self.sr_var = tk.StringVar(
                 value=sr if sr in SAMPLE_RATES else "48000")
-            self.sr_box = ttk.Combobox(top, state="readonly", width=14,
+            self.sr_box = ttk.Combobox(opt, state="readonly", width=6,
                                        textvariable=self.sr_var,
                                        values=SAMPLE_RATES)
             self.sr_box.bind("<<ComboboxSelected>>",
-                             lambda e: self.reopen_all())
-            self.sr_box.pack(side="left", padx=4)
-            self.refresh_btn = ttk.Button(top, text="Rescan devices",
-                                          command=self.rescan)
-            self.refresh_btn.pack(side="right")
+                             lambda e: (self.reopen_all(),
+                                        self.update_summary()))
+            self._field(opt, 2, "Sample rate", self.sr_box)
+            self.preroll_var = tk.StringVar(
+                value=str(s.get("preroll_seconds", 0)))
+            self.preroll_box = ttk.Spinbox(opt, from_=0, to=30, increment=1,
+                                           width=6,
+                                           textvariable=self.preroll_var)
+            self._field(opt, 3, "Pre-record", self.preroll_box, "sec")
+            self.split_var = tk.StringVar(value=str(s.get("split_minutes", 0)))
+            self.split_box = ttk.Spinbox(opt, from_=0, to=600, increment=5,
+                                         width=6, textvariable=self.split_var)
+            self._field(opt, 4, "New file every", self.split_box, "min")
+            self.stop_after_var = tk.StringVar(
+                value=str(s.get("stop_after_minutes", 0)))
+            self.stop_after_box = ttk.Spinbox(
+                opt, from_=0, to=1440, increment=5, width=6,
+                textvariable=self.stop_after_var)
+            self._field(opt, 5, "Auto-stop after", self.stop_after_box, "min")
 
-            self.list_frame = ttk.LabelFrame(root, text="Microphones",
-                                             padding=6)
-            self.list_frame.pack(fill="both", expand=True, padx=8)
-
-            mon = ttk.Frame(root, padding=(8, 8, 8, 0))
-            mon.pack(fill="x")
-            ttk.Label(mon, text="Listen to:").pack(side="left")
+            mon = self._section(side, "Monitor")
             self.mon_var = tk.StringVar(value="Off")
-            self.mon_box = ttk.Combobox(mon, state="readonly", width=24,
+            self.mon_box = ttk.Combobox(mon, state="readonly", width=22,
                                         textvariable=self.mon_var,
                                         postcommand=self.fill_monitor_list)
             self.mon_box.bind("<<ComboboxSelected>>",
                               lambda e: self.update_monitor())
-            self.mon_box.pack(side="left", padx=4)
-            ttk.Label(mon, text="through:").pack(side="left", padx=(8, 0))
+            self._field(mon, 1, "Listen to", self.mon_box)
             self.out_dev_var = tk.StringVar()
-            self.out_dev_box = ttk.Combobox(mon, state="readonly", width=40,
+            self.out_dev_box = ttk.Combobox(mon, state="readonly", width=22,
                                             textvariable=self.out_dev_var)
             self.out_dev_box.bind("<<ComboboxSelected>>",
                                   lambda e: self.update_monitor())
-            self.out_dev_box.pack(side="left", padx=4)
+            self._field(mon, 2, "Through", self.out_dev_box)
 
-            out = ttk.Frame(root, padding=8)
-            out.pack(fill="x")
-            ttk.Label(out, text="Save to:").pack(side="left")
-            default_out = os.path.join(os.path.expanduser("~"), "Music",
-                                       "MultiMic")
-            self.out_var = tk.StringVar(value=s.get("out", default_out))
-            ttk.Entry(out, textvariable=self.out_var).pack(
-                side="left", fill="x", expand=True, padx=4)
-            ttk.Button(out, text="Browse...", command=self.browse).pack(
-                side="left")
-            ttk.Button(out, text="Open folder", command=self.open_folder).pack(
-                side="left", padx=(4, 0))
+            keys = ttk.Label(side, foreground=FAINT, font=self.f_small,
+                             text="Space  record / stop    P  pause    "
+                                  "M  marker")
+            keys.pack(anchor="w", pady=(4, 0))
 
-            opts = ttk.Frame(root, padding=(8, 0, 8, 0))
-            opts.pack(fill="x")
-            ttk.Label(opts, text="Session name:").pack(side="left")
-            self.name_var = tk.StringVar()
-            self.name_entry = ttk.Entry(opts, width=28,
-                                        textvariable=self.name_var)
-            self.name_entry.pack(side="left", padx=4)
-            ttk.Label(opts, text="(optional)",
-                      foreground="#666").pack(side="left")
-            ttk.Label(opts, text="Pre-record").pack(side="left", padx=(16, 0))
-            self.preroll_var = tk.StringVar(
-                value=str(s.get("preroll_seconds", 0)))
-            self.preroll_box = ttk.Spinbox(
-                opts, from_=0, to=30, increment=1, width=4,
-                textvariable=self.preroll_var)
-            self.preroll_box.pack(side="left", padx=4)
-            ttk.Label(opts, text="s before Record").pack(side="left")
-            ttk.Label(opts, text="min (0 = off)").pack(side="right")
-            self.stop_after_var = tk.StringVar(
-                value=str(s.get("stop_after_minutes", 0)))
-            self.stop_after_box = ttk.Spinbox(
-                opts, from_=0, to=1440, increment=5, width=5,
-                textvariable=self.stop_after_var)
-            self.stop_after_box.pack(side="right", padx=4)
-            ttk.Label(opts, text="Stop automatically after").pack(side="right")
-
-            bottom = ttk.Frame(root, padding=8)
-            bottom.pack(fill="x")
-            ttk.Label(bottom, text="Format:").pack(side="left")
-            fmt = s.get("format", "WAV 24-bit")
-            self.fmt_var = tk.StringVar(
-                value=fmt if fmt in FORMATS else "WAV 24-bit")
-            self.fmt_box = ttk.Combobox(bottom, state="readonly", width=16,
-                                        textvariable=self.fmt_var,
-                                        values=list(FORMATS))
-            self.fmt_box.pack(side="left", padx=4)
-            ttk.Label(bottom, text="Mixdown:").pack(side="left", padx=(12, 0))
-            mix = s.get("mixdown", "Off")
-            self.mix_var = tk.StringVar(value=mix if mix in MIX_MODES
-                                        else "Off")
-            self.mix_box = ttk.Combobox(bottom, state="readonly", width=24,
-                                        textvariable=self.mix_var,
-                                        values=list(MIX_MODES))
-            self.mix_box.pack(side="left", padx=4)
-            ttk.Label(bottom, text="New file every").pack(side="left",
-                                                          padx=(12, 0))
-            self.split_var = tk.StringVar(value=str(s.get("split_minutes", 0)))
-            self.split_box = ttk.Spinbox(bottom, from_=0, to=600, increment=5,
-                                         width=5, textvariable=self.split_var)
-            self.split_box.pack(side="left", padx=4)
-            ttk.Label(bottom, text="min (0 = off)").pack(side="left")
-
-            self.rec_btn = tk.Button(bottom, text="●  Record", width=14,
-                                     bg="#c22", fg="white",
-                                     activebackground="#e33",
-                                     font=("Segoe UI", 11, "bold"),
-                                     command=self.toggle_record)
-            self.rec_btn.pack(side="right")
-            self.marker_btn = ttk.Button(bottom, text="Marker (M)",
-                                         state="disabled",
-                                         command=self.add_marker)
-            self.marker_btn.pack(side="right", padx=(4, 4))
-            self.pause_btn = ttk.Button(bottom, text="Pause (P)", width=12,
-                                        state="disabled",
-                                        command=self.toggle_pause)
-            self.pause_btn.pack(side="right", padx=(8, 0))
-            self.clock = ttk.Label(bottom, text="00:00:00",
-                                   font=("Consolas", 16))
-            self.clock.pack(side="right", padx=12)
-            status_bar = ttk.Frame(root, padding=(8, 0, 8, 8))
-            status_bar.pack(fill="x")
-            self.disk = ttk.Label(status_bar)
-            self.disk.pack(side="right")
-            self.status = ttk.Label(status_bar,
-                                    text="Tick the microphones to use.")
+        def _build_status(self):
+            ttk.Separator(self.root).grid(row=3, column=0, sticky="ew")
+            bar = ttk.Frame(self.root, padding=(24, 8, 24, 10))
+            bar.grid(row=4, column=0, sticky="ew")
+            self.status = ttk.Label(bar, text="Switch on the microphones "
+                                              "you want to use.",
+                                    foreground=DIM)
             self.status.pack(side="left", fill="x", expand=True)
-            self._ticks = 0
+            self.disk = ttk.Label(bar, foreground=DIM)
+            self.disk.pack(side="right")
 
-            root.bind("<space>", self.space)
-            root.bind("<Key-m>", self.marker_key)
-            root.bind("<Key-M>", self.marker_key)
-            root.bind("<Key-p>", self.pause_key)
-            root.bind("<Key-P>", self.pause_key)
-            self.build_rows()
-            self.tick()
+        def set_status(self, text, warn=False):
+            self.status.config(text=text, foreground=WARN if warn else DIM)
+
+        def update_summary(self):
+            n = sum(1 for r in self.rows if r.mic.is_open)
+            sr = self.sr_var.get()
+            rate = "device rate" if sr == "Device default" \
+                else f"{int(sr) / 1000:g} kHz"
+            self.summary.config(
+                text=f"{n} of {len(self.rows)} mics on  ·  {rate}  ·  "
+                     f"{self.fmt_var.get()}")
 
         # -- settings -------------------------------------------------------
 
@@ -1096,23 +1375,17 @@ def run_gui():
             self.rows = []
             api = self.api_box.current()
             api_name = hostapis()[api]
-            heads = ["Use", "Name", "Device", "Ch", "Gain", "", "", "Level",
-                     "", "Status"]
-            for col, head in enumerate(heads):
-                ttk.Label(self.list_frame, text=head,
-                          font=("Segoe UI", 9, "bold")).grid(
-                    row=0, column=col, sticky="w", padx=4)
             devices = input_devices(api)
             if not devices:
-                ttk.Label(self.list_frame,
-                          text="No input devices for this audio API.").grid(
-                    row=1, column=1, columnspan=3, sticky="w")
+                ttk.Label(self.list_frame, foreground=DIM, padding=20,
+                          text="No microphones found for this audio API.\n"
+                               "Plug one in and press Rescan.").grid(
+                    row=0, column=0, sticky="w")
             saved = self.settings.get("mics", {})
-            for n, (idx, info) in enumerate(devices, 1):
+            for n, (idx, info) in enumerate(devices):
                 self.rows.append(MicRow(self, self.list_frame, n,
                                         Mic(idx, info, api_name),
                                         saved.get(info["name"], {})))
-            self.list_frame.columnconfigure(1, weight=1)
 
             # monitor choices
             self.outputs = output_devices(api)
@@ -1136,6 +1409,7 @@ def run_gui():
             self.mon_var.set(next((r.label for r in self.rows
                                    if r.mic.name == want), "Off"))
             self.update_monitor()
+            self.update_summary()
 
         def reopen_all(self):
             for r in self.rows:
@@ -1156,7 +1430,7 @@ def run_gui():
             self.api_box.current(apis.index(want) if want in apis
                                  else preferred_hostapi())
             self.build_rows()
-            self.status.config(text="Device list refreshed.")
+            self.set_status("Device list refreshed.")
 
         # -- monitoring -----------------------------------------------------
 
@@ -1196,7 +1470,7 @@ def run_gui():
                 self.monitor = Monitor(out, int(row.mic.stream.samplerate),
                                        api_name)
             except Exception as e:
-                self.status.config(text=f"Could not start monitoring: {e}")
+                self.set_status(f"Could not start monitoring: {e}", warn=True)
                 return
             row.mic.monitor = self.monitor
 
@@ -1213,40 +1487,40 @@ def run_gui():
             if hasattr(os, "startfile"):
                 os.startfile(path)
 
+        def _typing(self, event):
+            return isinstance(event.widget, (tk.Entry, ttk.Entry,
+                                             ttk.Spinbox))
+
         def space(self, event):
-            # let the space bar type in text fields
-            if isinstance(event.widget, (tk.Entry, ttk.Entry)):
-                return
-            self.toggle_record()
+            if not self._typing(event):
+                self.toggle_record()
 
         def marker_key(self, event):
-            if isinstance(event.widget, (tk.Entry, ttk.Entry)):
-                return
-            self.add_marker()
+            if not self._typing(event):
+                self.add_marker()
 
         def pause_key(self, event):
-            if isinstance(event.widget, (tk.Entry, ttk.Entry)):
-                return
-            self.toggle_pause()
+            if not self._typing(event):
+                self.toggle_pause()
 
         def toggle_pause(self):
             if not self.session:
                 return
             if self.session.paused:
                 self.session.resume()
-                self.pause_btn.config(text="Pause (P)")
-                self.status.config(text="Recording resumed.")
+                self.pause_btn.config(text="Pause  (P)")
+                self.set_status("Recording resumed.")
             else:
                 self.session.pause()
-                self.pause_btn.config(text="Resume (P)")
-                self.status.config(text="Paused. Nothing is being recorded "
-                                        "until you resume.")
+                self.pause_btn.config(text="Resume  (P)")
+                self.set_status("Paused. Nothing is being recorded until you "
+                                "resume.")
 
         def add_marker(self):
             if not self.session:
                 return
             t, label = self.session.add_marker()
-            self.status.config(text=f"{label} at {fmt_time(t, True)}")
+            self.set_status(f"{label} at {fmt_time(t, True)}")
 
         def toggle_record(self):
             if self.session:
@@ -1258,7 +1532,7 @@ def run_gui():
             rows = [r for r in self.rows if r.mic.is_open]
             if not rows:
                 messagebox.showinfo("MultiMic",
-                                    "Tick at least one microphone first.")
+                                    "Switch on at least one microphone first.")
                 return
             for r in rows:
                 r.mic.label = r.label
@@ -1281,19 +1555,18 @@ def run_gui():
             self.session = session
             self.save()
             self.set_locked(True)
-            self.rec_btn.config(text="■  Stop", bg="#333",
-                                activebackground="#555")
-            self.status.config(text=f"Recording {len(rows)} mic(s) to "
-                                    f"{session.folder}")
+            self.rec_btn.set_recording(True)
+            self.set_status(f"Recording {len(rows)} mic(s) to "
+                            f"{session.folder}")
             self.update_disk()
 
         def stop(self, reason=""):
             session, self.session = self.session, None
             session.stop()
             self.set_locked(False)
-            self.rec_btn.config(text="●  Record", bg="#c22",
-                                activebackground="#e33")
-            self.clock.config(text=fmt_time(session.position), foreground="")
+            self.rec_btn.set_recording(False)
+            self.clock.config(text=fmt_time(session.position), foreground=FG)
+            self.state.config(text="SAVED", foreground=GREEN)
             drops = sum(m.overflows for m in session.mics)
             clips = sum(m.clips for m in session.mics)
             msg = f"Saved {len(session.mics)} mic(s) to {session.folder}"
@@ -1301,15 +1574,18 @@ def run_gui():
                 msg += " (+ mixdown)"
             if session.markers:
                 msg += f", {len(session.markers)} marker(s)"
+            warn = False
             if clips:
-                msg += "  - some mics clipped, turn their gain down"
+                msg += "  -  some mics clipped, turn their gain down"
+                warn = True
             if drops:
-                msg += f"  ({drops} buffer drop(s) - try fewer mics per USB hub)"
+                msg += f"  -  {drops} buffer drop(s), try fewer mics per hub"
+                warn = True
             if session.errors:
-                msg = "Errors: " + "; ".join(session.errors)
+                msg, warn = "Errors: " + "; ".join(session.errors), True
             if reason:
                 msg = f"{reason}. {msg}"
-            self.status.config(text=msg)
+            self.set_status(msg, warn)
             self.update_disk()
 
         def set_locked(self, locked):
@@ -1322,7 +1598,7 @@ def run_gui():
                 w.config(state="disabled" if locked else "normal")
             for w in (self.marker_btn, self.pause_btn):
                 w.config(state="normal" if locked else "disabled")
-            self.pause_btn.config(text="Pause (P)")
+            self.pause_btn.config(text="Pause  (P)")
             for r in self.rows:
                 r.set_locked(locked)
 
@@ -1337,13 +1613,13 @@ def run_gui():
                 rate = data_rate([r.mic for r in self.rows if r.mic.is_open],
                                  self.fmt_var.get(),
                                  MIX_MODES[self.mix_var.get()])
-            text = f"Disk: {fmt_bytes(free)} free"
+            text = f"{fmt_bytes(free)} free"
             low = False
             if rate:
                 left = (free - DISK_STOP_BYTES) / rate
-                text += f" (~{fmt_duration(left)} of recording)"
+                text += f"  ·  about {fmt_duration(left)} of recording left"
                 low = left < 600
-            self.disk.config(text=text, foreground="#c00" if low else "")
+            self.disk.config(text=text, foreground=WARN if low else DIM)
             if self.session and free < DISK_STOP_BYTES:
                 self.stop("Stopped: the disk is nearly full")
 
@@ -1356,9 +1632,12 @@ def run_gui():
                 elapsed = self.session.elapsed
                 paused = self.session.paused
                 blink = paused and (self._ticks // 10) % 2
-                self.clock.config(
-                    text=" " * 8 if blink else fmt_time(elapsed),
-                    foreground="#c80" if paused else "")
+                self.clock.config(text=fmt_time(elapsed),
+                                  foreground=AMBER if paused else FG)
+                self.state.config(
+                    text="PAUSED" if paused else "●  RECORDING",
+                    foreground=(BG if blink else AMBER) if paused else RED)
+                self.rec_btn.tick(paused)
                 limit = self.stop_after_minutes()
                 if limit and elapsed >= limit * 60:
                     self.stop(f"Stopped automatically after "
@@ -1366,6 +1645,7 @@ def run_gui():
             self._ticks += 1
             if self._ticks % 40 == 0:  # every 2 s
                 self.update_disk()
+                self.update_summary()
             self.root.after(50, self.tick)
 
         def quit(self):
@@ -1381,13 +1661,41 @@ def run_gui():
             self.root.destroy()
 
     if sys.platform == "win32":
-        try:  # crisp text on high-DPI screens
+        try:
             import ctypes
+            # crisp text on high-DPI screens, and our own taskbar icon
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "MultiMic")
         except Exception:
             pass
     root = tk.Tk()
+    try:
+        import sv_ttk
+        sv_ttk.set_theme("dark")
+    except Exception:  # theme missing: fall back to a plain dark look
+        style = ttk.Style(root)
+        style.theme_use("clam")
+        style.configure(".", background=BG, foreground=FG,
+                        fieldbackground="#2b2b2b")
+        style.configure("Card.TFrame", background=BG, relief="solid",
+                        borderwidth=1)
+    icon = resource_path("multimic.ico")
+    if sys.platform == "win32" and os.path.exists(icon):
+        root.iconbitmap(default=icon)
     App(root)
+    if sys.platform == "win32":
+        try:  # dark title bar on Windows 10/11
+            import ctypes
+            root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+            on = ctypes.c_int(1)
+            for attr in (20, 19):
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, attr, ctypes.byref(on), ctypes.sizeof(on)) == 0:
+                    break
+        except Exception:
+            pass
     root.mainloop()
 
 

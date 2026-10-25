@@ -34,7 +34,7 @@ jobs:
         # CI machines have no sound card, so only report problems here
         continue-on-error: true
         run: python multimic.py --list
-      - run: pyinstaller --noconfirm --onefile --windowed --name MultiMic multimic.py
+      - run: pyinstaller --noconfirm --onefile --windowed --name MultiMic --icon multimic.ico --add-data "multimic.ico;." --collect-data sv_ttk multimic.py
       - uses: actions/upload-artifact@v5
         with:
           name: MultiMic
