@@ -1,9 +1,11 @@
 name: Build
 
+# Every push runs the tests and builds the app. A release is published only
+# when the version in multimic/__init__.py changes, or when the workflow is
+# started by hand (Actions > Build > Run workflow).
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -21,8 +23,20 @@ jobs:
       - run: pip install numpy soundfile pytest
       - run: pytest -q tests
 
-  windows-exe:
-    needs: test
+  gui-smoke:
+    # drives the real window against fake audio devices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y xvfb
+      - run: pip install numpy soundfile sv-ttk
+      - run: xvfb-run -a -s "-screen 0 1400x900x24" python tests/gui_smoke.py
+
+  windows:
+    needs: [test, gui-smoke]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -33,19 +47,57 @@ jobs:
       - name: Check the app starts
         # CI machines have no sound card, so only report problems here
         continue-on-error: true
-        run: python multimic.py --list
-      - run: pyinstaller --noconfirm --onefile --windowed --name MultiMic --icon multimic.ico --add-data "multimic.ico;." --collect-data sv_ttk multimic.py
+        run: python launch.py --list
+
+      - name: Version
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=$(python tools/version.py)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if gh release view "v$v" > /dev/null 2>&1; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build app (one folder, starts faster than a single exe)
+        run: pyinstaller --noconfirm --windowed --name MultiMic --icon multimic.ico --add-data "multimic.ico;." --collect-data sv_ttk launch.py
+      - name: Portable zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/MultiMic -DestinationPath dist/MultiMic-portable.zip
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" packaging/installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - uses: actions/upload-artifact@v5
         with:
-          name: MultiMic
-          path: dist/MultiMic.exe
+          name: MultiMic-${{ steps.version.outputs.version }}
+          path: |
+            dist/MultiMic-Setup.exe
+            dist/MultiMic-portable.zip
+
       - name: Publish release
-        if: github.event_name == 'push'
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && steps.version.outputs.new == 'true')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.0.{0}', github.run_number) }}
-          name: MultiMic ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.0.{0}', github.run_number) }}
+          tag_name: v${{ steps.version.outputs.version }}
+          name: MultiMic ${{ steps.version.outputs.version }}
           target_commitish: ${{ github.sha }}
-          body: Download MultiMic.exe below and run it. No install needed.
-          files: dist/MultiMic.exe
+          body: |
+            **MultiMic-Setup.exe**: installs MultiMic with a Start menu entry (no admin rights needed).
+            **MultiMic-portable.zip**: unzip anywhere and run MultiMic.exe inside the folder.
+
+            Windows may warn that the app is from an unknown publisher the first time; click *More info > Run anyway*.
+          files: |
+            dist/MultiMic-Setup.exe
+            dist/MultiMic-portable.zip
           make_latest: true
