@@ -9,10 +9,11 @@ side panel.
 
 ## Get it
 
-**Ready-made exe:** every push to `main` builds `MultiMic.exe` on GitHub.
-Open the repo's **Actions** tab, click the latest *Build* run and download
-the **MultiMic** artifact. Tagged versions (`v1.0` and so on) also attach the
-exe to a **Release**.
+**Ready-made exe:** open the repo's **Releases** page (right-hand side of
+the main GitHub page) and download `MultiMic.exe` from the latest release.
+Every push to `main` builds and publishes a new one. No install needed: just
+run it. Windows may show a SmartScreen warning the first time because the exe
+isn't signed; click *More info > Run anyway*.
 
 **From source:**
 
